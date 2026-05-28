@@ -63,6 +63,17 @@ def find_petimages(path: Path) -> Path | None:
     return None
 
 
+def is_decodable_image(path: Path) -> bool:
+    """Valida imagenes ruidosas de PetImages antes de que TensorFlow arme batches."""
+    try:
+        raw = tf.io.read_file(str(path))
+        image = tf.io.decode_image(raw, channels=3, expand_animations=False)
+        _ = image.shape
+        return True
+    except Exception:
+        return False
+
+
 def rebuild_petimages_split(petimages_dir: Path, out_dir: Path, seed: int = 1337) -> Path:
     cat_dir = first_dir(petimages_dir, ["Cat", "Cats", "cat", "cats"])
     dog_dir = first_dir(petimages_dir, ["Dog", "Dogs", "dog", "dogs"])
@@ -76,24 +87,33 @@ def rebuild_petimages_split(petimages_dir: Path, out_dir: Path, seed: int = 1337
             (out_dir / split / cls).mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(seed)
+    skipped = 0
     for src_dir, cls in ((cat_dir, "cats"), (dog_dir, "dogs")):
         files = []
         for pattern in ("*.jpg", "*.jpeg", "*.png"):
             files.extend(src_dir.glob(pattern))
-        files = list(rng.permutation(files))
-        split_at = int(0.8 * len(files))
-        for i, src in enumerate(files):
+        valid_files = []
+        for src in files:
+            if is_decodable_image(src):
+                valid_files.append(src)
+            else:
+                skipped += 1
+        valid_files = list(rng.permutation(valid_files))
+        split_at = int(0.8 * len(valid_files))
+        for i, src in enumerate(valid_files):
             split = "train" if i < split_at else "validation"
             dst_name = f"{cls[:-1]}.{src.stem}{src.suffix.lower()}"
             shutil.copy2(src, out_dir / split / cls / dst_name)
+    if skipped:
+        print(f"[WARN] Imagenes corruptas/invalidas omitidas: {skipped}")
     print(f"[OK] Dataset PetImages reorganizado en: {out_dir}")
     return out_dir
 
 
 def rebuild_flat_split(files: list[Path], out_dir: Path, seed: int = 1337) -> Path:
-    files = [p for p in files if p.name.lower().startswith(("cat", "dog"))]
+    files = [p for p in files if p.name.lower().startswith(("cat", "dog")) and is_decodable_image(p)]
     if not files:
-        raise FileNotFoundError("No se encontraron imagenes cat.* o dog.*")
+        raise FileNotFoundError("No se encontraron imagenes cat.* o dog.* validas")
     if out_dir.exists():
         shutil.rmtree(out_dir, ignore_errors=True)
     for split in ("train", "validation"):
@@ -144,7 +164,10 @@ def resolve_dataset(data_dir: Path, local_data_dir: Path | None, local_zip: Path
 def load_dataset(base_dir: Path, img_size: int, batch: int, seed: int, augment: bool):
     train_raw = tf.keras.utils.image_dataset_from_directory(base_dir / "train", image_size=(img_size, img_size), batch_size=batch, label_mode="int", seed=seed, shuffle=True)
     val_raw = tf.keras.utils.image_dataset_from_directory(base_dir / "validation", image_size=(img_size, img_size), batch_size=batch, label_mode="int", seed=seed, shuffle=False)
-    print("[INFO] Clases:", train_raw.class_names)
+    class_names = train_raw.class_names
+    train_raw = train_raw.apply(tf.data.experimental.ignore_errors())
+    val_raw = val_raw.apply(tf.data.experimental.ignore_errors())
+    print("[INFO] Clases:", class_names)
     normalizer = layers.Rescaling(1.0 / 255)
     aug = tf.keras.Sequential([layers.RandomFlip("horizontal"), layers.RandomRotation(0.05), layers.RandomZoom(0.10)])
     autotune = tf.data.AUTOTUNE
